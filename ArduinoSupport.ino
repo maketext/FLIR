@@ -19,6 +19,7 @@ void setup() {
   Serial.println("Init Complete.");
 }
 void loop() {
+  delay(1000);
 }
 void fn() {
   delay(1); // Debouncing support. 디바운싱 고려.
