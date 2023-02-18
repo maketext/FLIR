@@ -21,7 +21,7 @@ void setup() {
 void loop() {
 }
 void fn() {
-  delay(1);
+  delay(1); // Debouncing support. 디바운싱 고려.
   current = digitalRead(DATAIN_PIN);
   Serial.print(current);
   Serial.println(" Read.");
