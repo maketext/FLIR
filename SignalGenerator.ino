@@ -1,4 +1,5 @@
-// 디지털 펄스 신호 생성기.
+// 장비에서 나오는 신호를 가상으로 만든 디지털 펄스 신호 생성기 입니다.
+// A digital pulse signal generator that virtualizes signals from the equipment.
 
 const int TRIGGER_PIN = 10;
 
