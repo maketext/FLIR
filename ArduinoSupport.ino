@@ -1,5 +1,10 @@
-// Receive hardware trigger signals from equipment or test electronic switches and transmit RS232 signals to the Lighting Controller. The Software Part.
-// 장비 또는 테스트용 전자스위치로부터 하드웨어 트리거 신호를 받아 조명 컨트롤러로 RS232 신호 전송. 솔루션에 사용되는 소프트웨어 파트.
+// Want to build a solution that receives a hardware trigger signal from an electronic switch for testing or equipment,
+// send a TTL TX signal to a PC, and transmits an RS232 signal from the PC to the lighting controller via a USB jack converter.
+
+// This source code is uploaded to Arduino, which act as the router receiving a 5V digital pulse signal from the electronic switch.
+
+// 장비 또는 테스트용 전자스위치로부터 하드웨어 트리거 신호를 받아 PC로 TTL TX 신호를 인가한 뒤, PC에서 USB 잭 컨버터를 통해 조명 컨트롤러로 RS232 신호를 전송하는 솔루션을 제작하려고 하고 있습니다.
+// 이 소스코드는 그 중 전자스위치로부터 5V 디지털 펄스 신호를 받는 라우터를 담당하는 아두이노에 업로드 됩니다.
 
 #include <SoftwareSerial.h>
 
