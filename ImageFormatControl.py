@@ -4,6 +4,7 @@ import PySpin
 import sys
 import zmq
 import pickle
+import numpy as np
 from reactivex import Subject
 from pathlib import Path
 import base64
@@ -24,44 +25,49 @@ print("bound to 0MQ Server - PUSH.")
 import os, os.path
 import time
 
-def configure_custom_image_settings(nodemap, s_nodemap):
-    try:
-        def setNodeValue(nodeName, nodeValue):
-            node = None
-            if nodeValue == True or nodeValue == False:
-                node = PySpin.CBooleanPtr(nodemap.GetNode(nodeName))
-            elif isinstance(nodeValue, int) or isinstance(nodeValue, str):
-                node = PySpin.CEnumerationPtr(nodemap.GetNode(nodeName))
-            elif isinstance(nodeValue, float):
-                node = PySpin.CFloatPtr(nodemap.GetNode(nodeName))
-            else:
-                return False
-            if node is None:
-                print("노드 값 데이터형을 지원하지 않음")
-                return False
-            if not PySpin.IsAvailable(node):
-                print("노드가 가능하지 않음.")
-                return False
-            if  not PySpin.IsWritable(node):
-                print("노드에 쓸 수 없음.")
-                return False
-            if isinstance(nodeValue, str):
-                handlingNodeValue = PySpin.CEnumEntryPtr(node.GetEntryByName(nodeValue))
-                if not PySpin.IsAvailable(handlingNodeValue) or not PySpin.IsReadable(handlingNodeValue):
-                    return False
-                handlingNodeValue = handlingNodeValue.GetValue()
-            else:
-                handlingNodeValue = nodeValue
-            print(f'{nodeName} = {handlingNodeValue} {type(handlingNodeValue)} 설정 시도...')
-            if handlingNodeValue is not None:
-                if nodeValue == True or nodeValue == False:
-                    node.SetValue(handlingNodeValue)
-                elif isinstance(nodeValue, int) or isinstance(nodeValue, str):
-                    node.SetIntValue(handlingNodeValue)
-                else: #Float 형
-                    node.SetValue(handlingNodeValue)
-                return True
+system, cam_list, cam, nodemap, quitFlag, acquisitonCount = None, None, None, None, None, -1
+
+def setNodeValue(nodeName, nodeValue):
+    global nodemap
+    node = None
+    if nodeValue == True or nodeValue == False:
+        node = PySpin.CBooleanPtr(nodemap.GetNode(nodeName))
+    elif isinstance(nodeValue, int) or isinstance(nodeValue, str):
+        node = PySpin.CEnumerationPtr(nodemap.GetNode(nodeName))
+    elif isinstance(nodeValue, float):
+        node = PySpin.CFloatPtr(nodemap.GetNode(nodeName))
+    else:
+        return False
+    if node is None:
+        print("노드 값 데이터형을 지원하지 않음")
+        return False
+    if not PySpin.IsAvailable(node):
+        print("노드가 가능하지 않음.")
+        return False
+    if not PySpin.IsWritable(node):
+        print("노드에 쓸 수 없음.")
+        return False
+    if isinstance(nodeValue, str):
+        handlingNodeValue = PySpin.CEnumEntryPtr(node.GetEntryByName(nodeValue))
+        if not PySpin.IsAvailable(handlingNodeValue) or not PySpin.IsReadable(handlingNodeValue):
             return False
+        handlingNodeValue = handlingNodeValue.GetValue()
+    else:
+        handlingNodeValue = nodeValue
+    print(f'{nodeName} = {handlingNodeValue} {type(handlingNodeValue)} 설정 시도...')
+    if handlingNodeValue is not None:
+        if nodeValue == True or nodeValue == False:
+            node.SetValue(handlingNodeValue)
+        elif isinstance(nodeValue, int) or isinstance(nodeValue, str):
+            node.SetIntValue(handlingNodeValue)
+        else:  # Float 형
+            node.SetValue(handlingNodeValue)
+        return True
+    return False
+
+
+def configure_custom_image_settings(s_nodemap):
+    try:
         if not setNodeValue('AcquisitionMode', 'Continuous'): # SingleFrame, MultiFrame, Continuous 중 하나
             print('AcquisitionMode=Continuous 설정 실패')
         if not setNodeValue('AcquisitionFrameRateEnable', True):
@@ -88,7 +94,7 @@ def configure_custom_image_settings(nodemap, s_nodemap):
             print('Unable to set Buffer Handling mode (Entry retrieval). Aborting...\n')
             return False
 
-        handlingModeNewestOnly = PySpin.CEnumEntryPtr(handlingMode.GetEntryByName('OldestFirst')) #NewestFirst OldestFirst
+        handlingModeNewestOnly = PySpin.CEnumEntryPtr(handlingMode.GetEntryByName('NewestFirst')) #NewestFirst OldestFirst
         if not PySpin.IsAvailable(handlingModeNewestOnly) or not PySpin.IsReadable(handlingModeNewestOnly):
             print('Unable to set Buffer Handling mode (Value retrieval). Aborting...\n')
             return False
@@ -118,7 +124,7 @@ def configure_custom_image_settings(nodemap, s_nodemap):
         # Display Buffer Info
         print('Default Buffer Count: %d' % buffer_count.GetValue())
         print('Maximum Buffer Count: %d' % buffer_count.GetMax())
-        buffer_count.SetValue(20)
+        #buffer_count.SetValue(20)
         print('Buffer count now set to: %d' % buffer_count.GetValue())
 
         ''' 싱글프레임모드일 경우 제외
@@ -234,7 +240,6 @@ def print_device_info(nodemap):
 
     return True
 
-system, cam_list, cam, quitFlag, acquisitonCount = None, None, None, None, -1
 
 def triggerSet(cam):
     # Execute software trigger
@@ -251,7 +256,6 @@ def triggerSet(cam):
 
 
 def acquire_images(image_result, count, isSaved):
-    global client
     try:
         if isSaved == False:
             image_result.Release()
@@ -261,22 +265,22 @@ def acquire_images(image_result, count, isSaved):
             print('Image incomplete with image status %d ...' % image_result.GetImageStatus())
         else:
 
-            image_result = image_result.Convert(PySpin.PixelFormat_BGR8, PySpin.IIDC) #IIDC
-            #image_result_0 = image_result.Convert(PySpin.PixelFormat_Mono8, PySpin.IIDC)
-            im = Image.fromarray(image_result.GetNDArray())
+            image_converted = image_result.Convert(PySpin.PixelFormat_BGR8, PySpin.IIDC)
+            #image_converted = image_result.Convert(PySpin.PixelFormat_BGR8, PySpin.HQ_LINEAR)
+            ndarray = np.flip(image_converted.GetNDArray(), axis=2) # No Gamma Adjustment needed. only this applied.
+            im = Image.fromarray(ndarray)
             im = im.resize((480, 320)) # 3:2 HVGA
-            im = F.adjust_hue(im, -166 / 180 * 0.5)
-            #im = F.adjust_hue(im, -169 / 180 * 0.5)
+            #im = F.adjust_hue(im, -166 / 180 * 0.5)
             #im = F.adjust_saturation(im, 1.5)
             #im = ImageEnhance.Contrast(im).enhance(1.5)
             buffered = BytesIO()
-            im.save(buffered, format="PNG")
+            im.save(buffered, format="JPEG")
             img_str = base64.b64encode(buffered.getvalue())
-            socketPush.send_multipart(msg_parts=["raw-img", img_str], copy=False, track=False)
+            socketPush.send_multipart(msg_parts=[img_str], copy=False, track=False)
             print(fr'0MQ 전송 완료')
 
-            image_result.Save(fr'{Path.home()}/Pictures/cam.jpg')
-            print(fr'이미지 저장 완료, width = {image_result.GetWidth()}, height = {image_result.GetHeight()} ({image_result.GetFrameID()})')
+            image_converted.Save(fr'{Path.home()}/Pictures/cam.jpg')
+            print(fr'이미지 저장 완료, width = {image_converted.GetWidth()}, height = {image_converted.GetHeight()} ({image_converted.GetFrameID()})')
 
     except PySpin.SpinnakerException as ex:
         print('Error: %s' % ex)
@@ -293,14 +297,14 @@ class ImageEventHandler(PySpin.ImageEventHandler):
 
 eventHandler = ImageEventHandler(cam)
 def run_single_camera(cam):
-    global eventHandler
+    global eventHandler, nodemap
     try:
         #nodemap_tldevice = cam.GetTLDeviceNodeMap()
         cam.Init()
         nodemap = cam.GetNodeMap()
         s_nodemap = cam.GetTLStreamNodeMap()
 
-        if not configure_custom_image_settings(nodemap, s_nodemap):
+        if not configure_custom_image_settings(s_nodemap):
             return False
 
         # 카메라 이미지 취득 준비
@@ -400,12 +404,14 @@ def open_0mq():
                 subscription.dispose()
                 print("카메라 객체 반환")
                 try:
+                    cam.UnregisterEventHandler(eventHandler)
                     cam.EndAcquisition()
+                    if not setNodeValue('TriggerMode', 'Off'):
+                        print('TriggerMode 설정 실패')
                 except Exception as e:
                     print('cam.EndAcquisition()', e.message)
                     pass
                 try:
-                    cam.UnregisterEventHandler(eventHandler)
                     cam.DeInit()
                 except Exception as e:
                     print('cam.DeInit()~', e.message)
