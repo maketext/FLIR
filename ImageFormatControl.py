@@ -2,11 +2,10 @@ import torchvision.transforms.functional as F
 from PIL import Image, ImageEnhance
 import PySpin
 import sys
-
 import zmq
-import asyncio
+import pickle
+from reactivex import Subject
 from pathlib import Path
-import threading
 import base64
 from io import BytesIO
 
@@ -252,7 +251,7 @@ def triggerSet(cam):
 
 
 def acquire_images(image_result, count, isSaved):
-    global client, clientIpc
+    global client
     try:
         if isSaved == False:
             image_result.Release()
@@ -273,7 +272,7 @@ def acquire_images(image_result, count, isSaved):
             buffered = BytesIO()
             im.save(buffered, format="PNG")
             img_str = base64.b64encode(buffered.getvalue())
-            socketPush.send_multipart(msg_parts=[img_str], copy=False, track=False)
+            socketPush.send_multipart(msg_parts=["raw-img", img_str], copy=False, track=False)
             print(fr'0MQ 전송 완료')
 
             image_result.Save(fr'{Path.home()}/Pictures/cam.jpg')
@@ -348,10 +347,8 @@ def main():
     return system, cam_list
 
 
-async def mqtt_main():
-    global acquisitonCount
-
-    global client, quitFlag, cam, system
+def init_cam():
+    global cam_list, cam, system
     if run_single_camera(cam) == False:
         try:
             cam.EndAcquisition()
@@ -371,25 +368,36 @@ async def mqtt_main():
         print("카메라 이미지 취득 시작")
         print(f'cam={cam}')
         cam.BeginAcquisition()
-    connNum = 0
+
+def open_0mq():
+    global cam_list, cam, system
+
+    subject = Subject()
+    def subscribeSocket(result):
+        (connectionCount, status, msg) = result
+        print(f'status={status}, msg={msg} ({connectionCount})')
+
+        if status == 200:  # 정상
+            pass
+        elif status == 401:  # 중지
+            pass
+        elif status == 400:  # 소프트웨어 트리거
+            print("트리거")
+            triggerSet(cam)
+    subscription = subject.subscribe(subscribeSocket)
+
+    connectionCount = 0
     while True:
         try:
             #await asyncio.sleep(0.11) 간헐적 응답 실패 이유로 주석 처리됨.
-
-            content = socket.recv_string() # 블록됨.
-            connNum = connNum + 1
-            print(f'content={content} ({connNum})')
-            status, msg = content.split()
+            result = socket.recv_string() # 블록됨.
+            connectionCount = connectionCount + 1
+            status, msg = result.split()
             status = int(status)
-            print(f'status={status}, msg={msg}')
-            if status == 200: # 정상
-               pass
-            elif status == 401: # 중지
-                pass
-            elif status == 400: # 소프트웨어 트리거
-                print("트리거")
-                triggerSet(cam)
-            elif status == 402: # 종료
+
+            # 프로그램 종료
+            if status == 402:
+                subscription.dispose()
                 print("카메라 객체 반환")
                 try:
                     cam.EndAcquisition()
@@ -407,9 +415,11 @@ async def mqtt_main():
                 system.ReleaseInstance()
                 print("잠시후 프로그램이 종료됩니다.")
                 break
-
+            else:
+                subject.on_next((connectionCount, status, msg))
         except ConnectionRefusedError:
-            await asyncio.sleep(3)
+            print('ConnectionRefusedError')
+            #await asyncio.sleep(3)
             pass
         except:
             pass
@@ -420,6 +430,6 @@ if __name__ == '__main__':
     if cam_list:
         cam = cam_list.GetByIndex(0)
         if not cam:
-            clientIpc.close()
             sys.exit(0)
-        asyncio.get_event_loop().run_until_complete(mqtt_main())
+        init_cam()
+        open_0mq()
