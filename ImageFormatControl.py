@@ -1,18 +1,22 @@
 import torchvision.transforms.functional as F
 from PIL import Image, ImageEnhance
+import os
 import PySpin
 import sys
+
 import zmq
-import pickle
-import numpy as np
-from reactivex import Subject
+import json
+import asyncio
 from pathlib import Path
+import traceback
+import threading, time
 import base64
+import numpy as np
 from io import BytesIO
 
 client = None
 
-# 0MQ
+# 0MQ 소스코드
 context = zmq.Context()
 socket = context.socket(zmq.PULL)
 socket.connect("tcp://127.0.0.1:1881")
@@ -20,54 +24,50 @@ print("Connected to 0MQ Server - PULL.")
 socketPush = context.socket(zmq.PUSH)
 socketPush.bind("tcp://127.0.0.1:1880")
 print("bound to 0MQ Server - PUSH.")
-# 0MQ End.
+# 끝
 
 import os, os.path
 import time
+import requests
 
-system, cam_list, cam, nodemap, quitFlag, acquisitonCount = None, None, None, None, None, -1
-
-def setNodeValue(nodeName, nodeValue):
-    global nodemap
-    node = None
-    if nodeValue == True or nodeValue == False:
-        node = PySpin.CBooleanPtr(nodemap.GetNode(nodeName))
-    elif isinstance(nodeValue, int) or isinstance(nodeValue, str):
-        node = PySpin.CEnumerationPtr(nodemap.GetNode(nodeName))
-    elif isinstance(nodeValue, float):
-        node = PySpin.CFloatPtr(nodemap.GetNode(nodeName))
-    else:
-        return False
-    if node is None:
-        print("노드 값 데이터형을 지원하지 않음")
-        return False
-    if not PySpin.IsAvailable(node):
-        print("노드가 가능하지 않음.")
-        return False
-    if not PySpin.IsWritable(node):
-        print("노드에 쓸 수 없음.")
-        return False
-    if isinstance(nodeValue, str):
-        handlingNodeValue = PySpin.CEnumEntryPtr(node.GetEntryByName(nodeValue))
-        if not PySpin.IsAvailable(handlingNodeValue) or not PySpin.IsReadable(handlingNodeValue):
-            return False
-        handlingNodeValue = handlingNodeValue.GetValue()
-    else:
-        handlingNodeValue = nodeValue
-    print(f'{nodeName} = {handlingNodeValue} {type(handlingNodeValue)} 설정 시도...')
-    if handlingNodeValue is not None:
-        if nodeValue == True or nodeValue == False:
-            node.SetValue(handlingNodeValue)
-        elif isinstance(nodeValue, int) or isinstance(nodeValue, str):
-            node.SetIntValue(handlingNodeValue)
-        else:  # Float 형
-            node.SetValue(handlingNodeValue)
-        return True
-    return False
-
-
-def configure_custom_image_settings(s_nodemap):
+def configure_custom_image_settings(nodemap, s_nodemap):
     try:
+        def setNodeValue(nodeName, nodeValue):
+            node = None
+            if nodeValue == True or nodeValue == False:
+                node = PySpin.CBooleanPtr(nodemap.GetNode(nodeName))
+            elif isinstance(nodeValue, int) or isinstance(nodeValue, str):
+                node = PySpin.CEnumerationPtr(nodemap.GetNode(nodeName))
+            elif isinstance(nodeValue, float):
+                node = PySpin.CFloatPtr(nodemap.GetNode(nodeName))
+            else:
+                return False
+            if node is None:
+                print("노드 값 데이터형을 지원하지 않음")
+                return False
+            if not PySpin.IsAvailable(node):
+                print("노드가 가능하지 않음.")
+                return False
+            if  not PySpin.IsWritable(node):
+                print("노드에 쓸 수 없음.")
+                return False
+            if isinstance(nodeValue, str):
+                handlingNodeValue = PySpin.CEnumEntryPtr(node.GetEntryByName(nodeValue))
+                if not PySpin.IsAvailable(handlingNodeValue) or not PySpin.IsReadable(handlingNodeValue):
+                    return False
+                handlingNodeValue = handlingNodeValue.GetValue()
+            else:
+                handlingNodeValue = nodeValue
+            print(f'{nodeName} = {handlingNodeValue} {type(handlingNodeValue)} 설정 시도...')
+            if handlingNodeValue is not None:
+                if nodeValue == True or nodeValue == False:
+                    node.SetValue(handlingNodeValue)
+                elif isinstance(nodeValue, int) or isinstance(nodeValue, str):
+                    node.SetIntValue(handlingNodeValue)
+                else: #Float 형
+                    node.SetValue(handlingNodeValue)
+                return True
+            return False
         if not setNodeValue('AcquisitionMode', 'Continuous'): # SingleFrame, MultiFrame, Continuous 중 하나
             print('AcquisitionMode=Continuous 설정 실패')
         if not setNodeValue('AcquisitionFrameRateEnable', True):
@@ -94,7 +94,7 @@ def configure_custom_image_settings(s_nodemap):
             print('Unable to set Buffer Handling mode (Entry retrieval). Aborting...\n')
             return False
 
-        handlingModeNewestOnly = PySpin.CEnumEntryPtr(handlingMode.GetEntryByName('NewestFirst')) #NewestFirst OldestFirst
+        handlingModeNewestOnly = PySpin.CEnumEntryPtr(handlingMode.GetEntryByName('OldestFirst')) #NewestFirst OldestFirst
         if not PySpin.IsAvailable(handlingModeNewestOnly) or not PySpin.IsReadable(handlingModeNewestOnly):
             print('Unable to set Buffer Handling mode (Value retrieval). Aborting...\n')
             return False
@@ -124,7 +124,7 @@ def configure_custom_image_settings(s_nodemap):
         # Display Buffer Info
         print('Default Buffer Count: %d' % buffer_count.GetValue())
         print('Maximum Buffer Count: %d' % buffer_count.GetMax())
-        #buffer_count.SetValue(20)
+        buffer_count.SetValue(20)
         print('Buffer count now set to: %d' % buffer_count.GetValue())
 
         ''' 싱글프레임모드일 경우 제외
@@ -133,6 +133,31 @@ def configure_custom_image_settings(s_nodemap):
             print('Unable to retrieve frame rate. Aborting...')
         else:
             nodeAcquisitionFramerate.SetValue(5.0)
+        '''
+
+
+
+        '''
+        node_pixel_format = PySpin.CEnumerationPtr(nodemap.GetNode('PixelFormat'))
+        if PySpin.IsAvailable(node_pixel_format) and PySpin.IsWritable(node_pixel_format):
+
+            # Retrieve the desired entry node from the enumeration node
+            node_pixel_format_mono8 = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName('BGR8')) # Mono8 BGR8
+            if PySpin.IsAvailable(node_pixel_format_mono8) and PySpin.IsReadable(node_pixel_format_mono8):
+
+                # Retrieve the integer value from the entry node
+                pixel_format_mono8 = node_pixel_format_mono8.GetValue()
+
+                # Set integer as new value for enumeration node
+                node_pixel_format.SetIntValue(pixel_format_mono8)
+
+                print('Pixel format set to %s...' % node_pixel_format.GetCurrentEntry().GetSymbolic())
+
+            else:
+                print('Pixel format mono 8 not available...')
+
+        else:
+            print('Pixel format not available...')
         '''
 
         # Apply minimum to offset X
@@ -241,6 +266,28 @@ def print_device_info(nodemap):
     return True
 
 
+# 사용 안함.
+def pre_acquire_images(nodemap):
+
+    try:
+        '''
+        cam.BeginAcquisition()
+
+        print('Acquiring images...')
+
+        device_serial_number = ''
+        node_device_serial_number = PySpin.CStringPtr(nodemap_tldevice.GetNode('DeviceSerialNumber'))
+        if PySpin.IsAvailable(node_device_serial_number) and PySpin.IsReadable(node_device_serial_number):
+            device_serial_number = node_device_serial_number.GetValue()
+            print('Device serial number retrieved as %s...' % device_serial_number)
+        '''
+    except PySpin.SpinnakerException as ex:
+        print('Error: %s' % ex)
+        return False
+    return True
+
+system, cam_list, cam, quitFlag, acquisitonCount = None, None, None, None, -1
+
 def triggerSet(cam):
     # Execute software trigger
     try:
@@ -256,6 +303,7 @@ def triggerSet(cam):
 
 
 def acquire_images(image_result, count, isSaved):
+    global client, clientIpc
     try:
         if isSaved == False:
             image_result.Release()
@@ -265,31 +313,38 @@ def acquire_images(image_result, count, isSaved):
             print('Image incomplete with image status %d ...' % image_result.GetImageStatus())
         else:
 
-            image_converted = image_result.Convert(PySpin.PixelFormat_BGR8, PySpin.IIDC)
-            #image_converted = image_result.Convert(PySpin.PixelFormat_BGR8, PySpin.HQ_LINEAR)
-            ndarray = np.flip(image_converted.GetNDArray(), axis=2) # No Gamma Adjustment needed. only this applied.
-            im = Image.fromarray(ndarray)
+            image_result = image_result.Convert(PySpin.PixelFormat_BGR8, PySpin.IIDC) #IIDC
+            #image_result_0 = image_result.Convert(PySpin.PixelFormat_Mono8, PySpin.IIDC)
+            im = Image.fromarray(image_result.GetNDArray())
             im = im.resize((480, 320)) # 3:2 HVGA
-            #im = F.adjust_hue(im, -166 / 180 * 0.5)
+            im = F.adjust_hue(im, -166 / 180 * 0.5)
+            #im = F.adjust_hue(im, -169 / 180 * 0.5)
             #im = F.adjust_saturation(im, 1.5)
             #im = ImageEnhance.Contrast(im).enhance(1.5)
             buffered = BytesIO()
-            im.save(buffered, format="JPEG")
+            im.save(buffered, format="PNG")
             img_str = base64.b64encode(buffered.getvalue())
             socketPush.send_multipart(msg_parts=[img_str], copy=False, track=False)
             print(fr'0MQ 전송 완료')
 
-            image_converted.Save(fr'{Path.home()}/Pictures/cam.jpg')
-            print(fr'이미지 저장 완료, width = {image_converted.GetWidth()}, height = {image_converted.GetHeight()} ({image_converted.GetFrameID()})')
+            image_result.Save(fr'{Path.home()}/Pictures/cam.jpg')
+            print(fr'이미지 저장 완료, width = {image_result.GetWidth()}, height = {image_result.GetHeight()} ({image_result.GetFrameID()})')
+
+
+            #mqtt.publish(client, '/img-save-ready')
+            #print('PUB', '/img-save-ready')
+            #image_result.Release()
 
     except PySpin.SpinnakerException as ex:
         print('Error: %s' % ex)
         #traceback.print_exc()
 
+    #mqtt.publish(client, '/img-save-ready')
+
 class ImageEventHandler(PySpin.ImageEventHandler):
     def __init__(self, cam):
         super(ImageEventHandler, self).__init__()
-
+        #del cam
     def OnImageEvent(self, image):
         global acquisitonCount
         acquisitonCount = acquisitonCount + 1
@@ -297,14 +352,23 @@ class ImageEventHandler(PySpin.ImageEventHandler):
 
 eventHandler = ImageEventHandler(cam)
 def run_single_camera(cam):
-    global eventHandler, nodemap
+    global eventHandler
+    """
+    This function acts as the body of the example; please see NodeMapInfo example
+    for more in-depth comments on setting up cameras.
+
+    :param cam: Camera to run on.
+    :type cam: CameraPtr
+    :return: True if successful, False otherwise.
+    :rtype: bool
+    """
     try:
         #nodemap_tldevice = cam.GetTLDeviceNodeMap()
         cam.Init()
         nodemap = cam.GetNodeMap()
         s_nodemap = cam.GetTLStreamNodeMap()
 
-        if not configure_custom_image_settings(s_nodemap):
+        if not configure_custom_image_settings(nodemap, s_nodemap):
             return False
 
         # 카메라 이미지 취득 준비
@@ -318,6 +382,14 @@ def run_single_camera(cam):
     return True
 
 def main():
+    """
+    Example entry point; please see Enumeration example for more in-depth
+    comments on preparing and cleaning up the system.
+
+    :return: True if successful, False otherwise.
+    :rtype: bool
+    """
+
     # 현재 프로세스의 파일 쓰기 권한 확인
     try:
         test_file = open('test.txt', 'w+')
@@ -328,12 +400,13 @@ def main():
 
     test_file.close()
     os.remove(test_file.name)
+    ##
 
     # 현재 라이브러리 버전 확인
     #version = system.GetLibraryVersion()
     #print('Library version: %d.%d.%d.%d' % (version.major, version.minor, version.type, version.build))
 
-    # 싱글톤 시스템 객체 취득 - 시작점
+    # 싱글톤 시스템 객체 취득- 시작점
     system = PySpin.System.GetInstance()
 
 
@@ -351,8 +424,14 @@ def main():
     return system, cam_list
 
 
-def init_cam():
-    global cam_list, cam, system
+async def mqtt_main():
+    global acquisitonCount
+    eventExitThread = threading.Event()
+    t = None
+
+
+
+    global client, quitFlag, cam, system
     if run_single_camera(cam) == False:
         try:
             cam.EndAcquisition()
@@ -373,45 +452,52 @@ def init_cam():
         print(f'cam={cam}')
         cam.BeginAcquisition()
 
-def open_0mq():
-    global cam_list, cam, system
-
-    subject = Subject()
-    def subscribeSocket(result):
-        (connectionCount, status, msg) = result
-        print(f'status={status}, msg={msg} ({connectionCount})')
-
-        if status == 200:  # 정상
-            pass
-        elif status == 401:  # 중지
-            pass
-        elif status == 400:  # 소프트웨어 트리거
-            print("트리거")
+    def fnTrigger(cam):
+        while (True):
+            if eventExitThread.is_set():
+                print("is_set()")
+                break
+            time.sleep(0.333)
             triggerSet(cam)
-    subscription = subject.subscribe(subscribeSocket)
 
-    connectionCount = 0
+    connNum = 0
     while True:
         try:
-            #await asyncio.sleep(0.11) 간헐적 응답 실패 이유로 주석 처리됨.
-            result = socket.recv_string() # 블록됨.
-            connectionCount = connectionCount + 1
-            status, msg = result.split()
-            status = int(status)
+            #await asyncio.sleep(0.11) 간헐적 응답 실패 이유
 
-            # 프로그램 종료
-            if status == 402:
-                subscription.dispose()
+            content = socket.recv_string() # 블록됨
+            #content = json.loads(content)
+            connNum = connNum + 1
+            print(f'content={content} ({connNum})')
+            status, msg = content.split()
+            status = int(status)
+            print(f'status={status}, msg={msg}')
+            if status == 200: # 정상
+               pass
+            elif status == 401: # 중지
+                '''
+                eventExitThread.set()
+                if t is not None and t.isAlive():
+                    continue
+                eventExitThread = threading.Event()
+                print('스레드 시작.')
+                t = threading.Thread(target=fnTrigger, args=(cam,))
+                t.start()
+                '''
+
+            elif status == 400: # 소프트웨어 트리거
+                print("트리거")
+                triggerSet(cam)
+                #mqtt.publish(client, '/img-start-ready')
+            elif status == 402: # 종료
                 print("카메라 객체 반환")
                 try:
-                    cam.UnregisterEventHandler(eventHandler)
                     cam.EndAcquisition()
-                    if not setNodeValue('TriggerMode', 'Off'):
-                        print('TriggerMode 설정 실패')
                 except Exception as e:
                     print('cam.EndAcquisition()', e.message)
                     pass
                 try:
+                    cam.UnregisterEventHandler(eventHandler)
                     cam.DeInit()
                 except Exception as e:
                     print('cam.DeInit()~', e.message)
@@ -421,21 +507,25 @@ def open_0mq():
                 system.ReleaseInstance()
                 print("잠시후 프로그램이 종료됩니다.")
                 break
-            else:
-                subject.on_next((connectionCount, status, msg))
+
         except ConnectionRefusedError:
-            print('ConnectionRefusedError')
-            #await asyncio.sleep(3)
+            await asyncio.sleep(3)
             pass
         except:
             pass
 
 if __name__ == '__main__':
+    #client = mqtt.newConnection()
+    '''
+    asyncio.get_event_loop().run_until_complete(mqtt_main())
+    system.ReleaseInstance()
+    exit(0)
+    '''
     system, cam_list = main()
 
     if cam_list:
         cam = cam_list.GetByIndex(0)
         if not cam:
+            clientIpc.close()
             sys.exit(0)
-        init_cam()
-        open_0mq()
+        asyncio.get_event_loop().run_until_complete(mqtt_main())
