@@ -1,7 +1,12 @@
+import threading
+
 import PySpin
 import time
 import base64
 import json
+import atexit
+import ctypes
+import traceback
 from reactivex import Subject
 from PIL import Image
 from io import BytesIO
@@ -11,8 +16,8 @@ from STOMPClient import MQ
 from CameraAction.inital.CameraAction import *
 from CameraAction.inital.CameraSetting import *
 
+flir = None
 grabTime = 0
-VENDER_TYPE = "FLIR"
 class Arguements():
     X1 = None
     Y1 = None
@@ -34,17 +39,24 @@ class Arguements():
     Angle_0 = None
     Angle_1 = None
     Angle_2 = None
+
+arguments = Arguements()
+
 class FLIRCameraSetting(CameraSetting):
-    def setNodeMap(self, s_nodemap):
+    s_nodemap = None
+    nodemap = None
+    def setStreamNodeMap(self, s_nodemap):
         self.s_nodemap = s_nodemap
+    def setNodeMap(self, nodemap):
+        self.nodemap = nodemap
 
     def setNodeValue(self, nodeName, nodeValue):
         if nodeValue == True or nodeValue == False:
-            node = PySpin.CBooleanPtr(self.s_nodemap.GetNode(nodeName))
+            node = PySpin.CBooleanPtr(self.nodemap.GetNode(nodeName))
         elif isinstance(nodeValue, int) or isinstance(nodeValue, str):
-            node = PySpin.CEnumerationPtr(self.s_nodemap.GetNode(nodeName))
+            node = PySpin.CEnumerationPtr(self.nodemap.GetNode(nodeName))
         elif isinstance(nodeValue, float):
-            node = PySpin.CFloatPtr(self.s_nodemap.GetNode(nodeName))
+            node = PySpin.CFloatPtr(self.nodemap.GetNode(nodeName))
         else:
             return False
         if node is None:
@@ -85,22 +97,25 @@ class FLIRCameraSetting(CameraSetting):
             return False
         return True
 
+acquisitonCount = 0
 class ImageEventHandler(PySpin.ImageEventHandler):
-    cameraAction = None
-    def __init__(self, cameraAction):
+    def __init__(self):
         super(ImageEventHandler, self).__init__()
-        self.cameraAction = cameraAction
 
     def OnImageEvent(self, image):
-        global acquisitonCount
+        global acquisitonCount, flir
         acquisitonCount = acquisitonCount + 1
-        self.cameraAction.onGrab(image, acquisitonCount, True)
-
+        flir.onGrab(flir.currentCamIndex, image, acquisitonCount, True)
 class cameraMQ():
     def setArgumentsFromJsonString(self, value):
+        global arguments
         payload = json.loads(value)
         for (key, value) in payload.items():
-            self.arguments.__setattr__(key, int(value))
+            if isinstance(value, int):
+                arguments.__setattr__(key, int(value))
+            else:
+                arguments.__setattr__(key, value)
+
         print("Arguments set.")
     #subject = Subject()
 
@@ -120,7 +135,6 @@ class cameraMQ():
         self.messageCallback = onMessageCallback
 
     def onMessage(self, payload):
-        global system, cam_list, arguments
         (topic, message) = payload
         print(f'STOMP: topic={topic}, msg={message}')
         self.messageCallback(topic, message)
@@ -128,11 +142,11 @@ class cameraMQ():
 class FLIRCameraAction(CameraAction):
     system = None
     cam_list = None
-    cam = None
+    currentCamIndex = None
     eventHandler = None
     mq = cameraMQ()
-    arguments = Arguements()
     cameraSetting = FLIRCameraSetting()
+    VENDER_TYPE = 'FLIR'
 
     errorTag = "ERROR FLIRCameraAction > onMounted:"
     infoTag = "INFO FLIRCameraAction > onMounted:"
@@ -170,14 +184,14 @@ class FLIRCameraAction(CameraAction):
         return True
 
     def __init__(self):
-        self.eventHandler = ImageEventHandler(self)
+        self.eventHandler = ImageEventHandler()
         def callback(topic, message):
             if topic == '':  # 정상
                 print(f"STOMP: 토픽 값이 없습니다.")
                 pass
             elif topic == '/img-stop':  # 중지
                 print(f"STOMP: 이미지 취득을 중지합니다. (행위 없음)")
-                MQ.pub('/cam-status', {'camNo': '-', 'type': VENDER_TYPE, 'status': 'Stopped'})
+                MQ.pub('/cam-status', {'camNo': '-', 'type': self.VENDER_TYPE, 'status': 'Stopped'})
                 pass
             elif topic == '/img-path':  # 이미지 저장 위치 변경 (수정 필요)
                 print('이미지 경로 변경: ', message)
@@ -196,24 +210,27 @@ class FLIRCameraAction(CameraAction):
                     isFilenameChanged = True
 
                 if isFilenameChanged:
-                    MQ.pub('/cam-status', {'camNo': '0', 'type': VENDER_TYPE, 'status': '이미지 저장 위치가 변경되었습니다.'})
+                    MQ.pub('/cam-status', {'camNo': '0', 'type': self.VENDER_TYPE, 'status': '이미지 저장 위치가 변경되었습니다.'})
                 else:
                     MQ.pub('/cam-status',
-                           {'camNo': '0', 'type': VENDER_TYPE, 'status': '이미지 저장 위치 변경 실패: 올바르지 않은 파일 위치 경로 에러'})
-            elif topic == '/img-start-0':  # 소프트웨어 트리거
+                           {'camNo': '0', 'type': self.VENDER_TYPE, 'status': '이미지 저장 위치 변경 실패: 올바르지 않은 파일 위치 경로 에러'})
+            elif topic == '/img-start-0' or topic == '/img-start':  # 소프트웨어 트리거
                 if len(self.cam_list) >= 1:
                     print(f"STOMP: 소프트웨어 트리거 명령을 감지하였습니다.")
                     print("ReactiveX: 소프트웨어 트리거 ON. cam[0] /img-start-0")
+                    self.currentCamIndex = 0
                     self.trigger(self.cam_list.GetByIndex(0))
             elif topic == '/img-start-1':  # 소프트웨어 트리거
                 if len(self.cam_list) >= 2:
                     print(f"STOMP: 소프트웨어 트리거 명령을 감지하였습니다.")
                     print("ReactiveX: 소프트웨어 트리거 ON. cam[1] /img-start-1")
+                    self.currentCamIndex = 1
                     self.trigger(self.cam_list.GetByIndex(1))
             elif topic == '/img-start-2':  # 소프트웨어 트리거
                 if len(self.cam_list) >= 3:
                     print(f"STOMP: 소프트웨어 트리거 명령을 감지하였습니다.")
                     print("ReactiveX: 소프트웨어 트리거 ON. cam[2] /img-start-2")
+                    self.currentCamIndex = 2
                     self.trigger(self.cam_list.GetByIndex(2))
             elif topic == '/img-start':  # 소프트웨어 트리거
                 print(f"STOMP: 소프트웨어 트리거 명령을 감지하였습니다.")
@@ -233,17 +250,23 @@ class FLIRCameraAction(CameraAction):
                 TIME_SLEEP = 2.5
                 print("/on-good-0")
             elif topic == '/on-change-param':
-                self.setArgumentsFromJsonString(message)
+                self.mq.setArgumentsFromJsonString(message)
         self.mq.defineMessageCallback(callback)
 
         def initCamera():
             if self.initSystemAndCameraList():
-                if self.onMounted():
-                    self.onBeginAcquisition()
+                for index in range(self.cam_list.GetSize()):
+                    cam = self.cam_list.GetByIndex(index=index)
+                    cam.Init()
+                    if not self.onMounted(cam):
+                        self.release()
+                        return
+                self.onBeginAcquisition()
         self.mq.onCreated(initCamera)
 
-    def onMounted(self):
-        self.cameraSetting.setNodeMap(self.cam.GetTLStreamNodeMap())
+    def onMounted(self, cam):
+        self.cameraSetting.setStreamNodeMap(cam.GetTLStreamNodeMap())
+        self.cameraSetting.setNodeMap(cam.GetNodeMap())
         try:
             # Set Buffer Handling Mode to OldestFirst
             handlingMode = PySpin.CEnumerationPtr(self.cameraSetting.s_nodemap.GetNode('StreamBufferHandlingMode'))
@@ -283,10 +306,10 @@ class FLIRCameraAction(CameraAction):
                 print('Buffer Count를 세트하기 위해 StreamBufferCountManual에 접근하고 쓰기 연산할 수 없습니다.')
                 return False
 
-            self.setNodeValue('AcquisitionMode', 'SingleFrame')  # SingleFrame, MultiFrame, Continuous 중 하나
-            self.setNodeValue('AcquisitionFrameRateEnable', True)
-            self.setNodeValue('AcquisitionFrameRate', 5.0)
-            self.setNodeValue('TriggerMode', 'Off')
+            self.cameraSetting.setNodeValue('AcquisitionMode', 'SingleFrame')  # SingleFrame, MultiFrame, Continuous 중 하나
+            self.cameraSetting.setNodeValue('AcquisitionFrameRateEnable', True)
+            self.cameraSetting.setNodeValue('AcquisitionFrameRate', 5.0)
+            self.cameraSetting.setNodeValue('TriggerMode', 'Off')
 
             print("=========")
             print(" SUMMARY ")
@@ -311,7 +334,7 @@ class FLIRCameraAction(CameraAction):
             # Numeric nodes have both a minimum and maximum. A minimum is retrieved
             # with the method GetMin(). Sometimes it can be important to check
             # minimums to ensure that your desired value is within range.
-            node_offset_x = PySpin.CIntegerPtr(self.cameraSetting.s_nodemap.GetNode('OffsetX'))
+            node_offset_x = PySpin.CIntegerPtr(self.cameraSetting.nodemap.GetNode('OffsetX'))
             if PySpin.IsAvailable(node_offset_x) and PySpin.IsWritable(node_offset_x):
                 node_offset_x.SetValue(node_offset_x.GetMin())
                 print('Offset X set to %i...' % node_offset_x.GetMin())
@@ -326,7 +349,7 @@ class FLIRCameraAction(CameraAction):
             # nodes, such as those corresponding to offsets X and Y, have an
             # increment of 1, which basically means that any value within range
             # is appropriate. The increment is retrieved with the method GetInc().
-            node_offset_y = PySpin.CIntegerPtr(self.cameraSetting.s_nodemap.GetNode('OffsetY'))
+            node_offset_y = PySpin.CIntegerPtr(self.cameraSetting.nodemap.GetNode('OffsetY'))
             if PySpin.IsAvailable(node_offset_y) and PySpin.IsWritable(node_offset_y):
                 node_offset_y.SetValue(node_offset_y.GetMin())
                 print('Offset Y set to %i...' % node_offset_y.GetMin())
@@ -341,7 +364,7 @@ class FLIRCameraAction(CameraAction):
             # important to check that the desired value is a multiple of the
             # increment. However, as these values are being set to the maximum,
             # there is no reason to check against the increment.
-            node_width = PySpin.CIntegerPtr(self.cameraSetting.s_nodemap.GetNode('Width'))
+            node_width = PySpin.CIntegerPtr(self.cameraSetting.nodemap.GetNode('Width'))
             if PySpin.IsAvailable(node_width) and PySpin.IsWritable(node_width):
 
                 width_to_set = node_width.GetMax()
@@ -355,7 +378,7 @@ class FLIRCameraAction(CameraAction):
             # *** NOTES ***
             # A maximum is retrieved with the method GetMax(). A node's minimum and
             # maximum should always be a multiple of its increment.
-            node_height = PySpin.CIntegerPtr(self.cameraSetting.s_nodemap.GetNode('Height'))
+            node_height = PySpin.CIntegerPtr(self.cameraSetting.nodemap.GetNode('Height'))
             if PySpin.IsAvailable(node_height) and PySpin.IsWritable(node_height):
                 height_to_set = node_height.GetMax()
                 node_height.SetValue(height_to_set)
@@ -405,17 +428,19 @@ class FLIRCameraAction(CameraAction):
     def trigger(self, cam):
         # Execute software trigger
         try:
-            nodemap = cam.GetNodeMap()
+            nodemap = self.cam_list.GetByIndex(0).GetNodeMap()
             triggerSoftware = PySpin.CCommandPtr(nodemap.GetNode('TriggerSoftware'))
             if not PySpin.IsAvailable(triggerSoftware) or not PySpin.IsWritable(triggerSoftware):
                 print(f'{self.errorTag} Unable to execute trigger. Aborting...')
                 return False
             #MQ.pub('/cam-status', {'camNo': '0', 'type': VENDER_TYPE, 'status': f'Trigger Start {time.time()}'})
             triggerSoftware.Execute()
+            print("triggerSoftware.Execute()")
         except PySpin.SpinnakerException as ex:
             print(f'{self.errorTag} %s' % ex)
 
-    def onGrab(self, image_result, count, isSaved):
+    def onGrab(self, camIndex, imagePtr, count, isSaved):
+        global arguments
         """
         FLIR 머신비전 카메라 소프트웨어 트리거 콜백 함수
         :param image_result: 취득 이미지 객체
@@ -425,26 +450,32 @@ class FLIRCameraAction(CameraAction):
         """
         try:
             if isSaved == False:
-                image_result.Release()
+                imagePtr.Release()
                 return
 
-            if image_result.IsIncomplete():
+            if imagePtr.IsIncomplete():
                 print(f'{self.errorTag} Image incomplete with image status %d ...' % image_result.GetImageStatus())
-                image_result.Release()
+                imagePtr.Release()
                 return
-            # image_converted = image_result.Convert(PySpin.PixelFormat_BGR8, PySpin.HQ_LINEAR) IIDC
+
+
             # ndarray = np.flip(image_converted.GetNDArray(), axis=2) # No Gamma Adjustment needed. only this applied.
-            if self.arguments.X1 is not None:
-                [x1, y1, x2, y2] = [self.arguments.X1, self.arguments.Y1, self.arguments.X2, self.arguments.Y2]
-            elif self.arguments.X1_0 is not None:
-                [x1, y1, x2, y2] = [self.arguments.X1_0, self.arguments.Y1_0, self.arguments.X2_0, self.arguments.Y2_0]
+            x1 = 0
+            y1 = 0
+            x2 = 0
+            y2 = 0
+            if arguments.X1 is not None:
+                [x1, y1, x2, y2] = [arguments.X1, arguments.Y1, arguments.X2, arguments.Y2]
+            elif arguments.X1_0 is not None:
+                [x1, y1, x2, y2] = [arguments.X1_0, arguments.Y1_0, arguments.X2_0, arguments.Y2_0]
             else:
+                print("onGrab return")
                 return
             w = x2 - x1
             h = y2 - y1
-            image_reset = image_result.ResetImage(width=w, height=h, offsetX=x1, offsetY=y1,
-                                                  pixelFormat=PySpin.PixelFormat_RGB8)
-            im = Image.fromarray(image_reset.GetNDArray())
+            imagePtr = imagePtr.Convert(PySpin.PixelFormat_RGB8, PySpin.IIDC)
+            imagePtr.ResetImage(w, h, x1, y1, PySpin.PixelFormat_RGB8)
+            im = Image.fromarray(imagePtr.GetNDArray())
             # im = im.resize((480, 320)) # 3:2 HVGA
             # im = F.adjust_gamma(im, 0.5, 1)
             # im = F.adjust_hue(im, -166 / 180 * 0.5)
@@ -453,47 +484,49 @@ class FLIRCameraAction(CameraAction):
             buffered = BytesIO()
             im.save(buffered, format="JPEG")
             base64string = base64.b64encode(buffered.getvalue())
-
-            message = f"Cam-No: {0}\n" + \
+            message = f"Cam-No: {camIndex}\n" + \
                       f"Base64-0: {base64string.decode('ascii')}\n" + \
                       f"Time: {grabTime}"
 
             MQ.pub('/img-recv', message, 1)
-            MQ.pub('/cam-status', {'camNo': '0', 'type': self.VENDER_TYPE,
-                                   'status': f'Captured Image Sent. Origin ({image_reset.GetWidth()}px, {image_reset.GetHeight()}px)'})
+            MQ.pub('/cam-status', {'camNo': camIndex, 'type': self.VENDER_TYPE,
+                                   'status': f'Captured Image Sent. Origin ({imagePtr.GetWidth()}px, {imagePtr.GetHeight()}px)'})
 
             print(fr'전송 완료 FLIR ---> DNN')
 
-            image_reset.Save(fr'{Path.home()}/Pictures/FLIR/cam-{time.time()}.jpg')
+            imagePtr.Save(fr'{Path.home()}/Pictures/FLIR/cam-{time.time()}.jpg')
             # MQ.pub('/cam-status', {'camNo': '0', 'type': VENDER_TYPE, 'status': 'Captured Image Saved'})
             print(
-                fr'이미지 저장 완료, width = {image_reset.GetWidth()}, height = {image_reset.GetHeight()} ({image_reset.GetFrameID()})')
+                fr'이미지 저장 완료, width = {imagePtr.GetWidth()}, height = {imagePtr.GetHeight()} ({imagePtr.GetFrameID()})')
             # socket['dnn-push'].send_multipart(msg_parts=['/start'.encode('utf8'), 'img_str'.encode('utf8')], copy=False, track=False)
 
         except PySpin.SpinnakerException as ex:
             MQ.pub('/cam-status', {'camNo': '0', 'type': self.VENDER_TYPE, 'status': ex})
             print('Error: %s' % ex)
-            # traceback.print_exc()
+        except Exception as ex:
+            print('Error: %s' % ex)
 
     def onBeginAcquisition(self):
-        self.cam.BeginAcquisition()
-        print(f"3 초간 촬영 테스트 후 이미지 취득을 시작합니다.")
-        time.sleep(3)
-        self.cam.EndAcquisition()
-        self.cameraSetting.setNodeValue('TriggerMode', 'On')
-        self.cameraSetting.setNodeValue('TriggerSource', 'Software')
-        self.cameraSetting.setNodeValue('TriggerSelector', 'FrameStart')  # AcquisitionStart
-        self.cam.RegisterEventHandler(self.eventHandler)
-        self.cam.BeginAcquisition()
-        print(f"이미지 취득을 시작합니다.")
+        for index in range(self.cam_list.GetSize()):
+            cam = self.cam_list.GetByIndex(index=index)
+            cam.BeginAcquisition()
+            print(f"3 초간 촬영 테스트 후 이미지 취득을 시작합니다.")
+            time.sleep(3)
+            cam.EndAcquisition()
+            self.cameraSetting.setNodeValue('TriggerMode', 'On')
+            self.cameraSetting.setNodeValue('TriggerSource', 'Software')
+            self.cameraSetting.setNodeValue('TriggerSelector', 'FrameStart')  # AcquisitionStart
+            cam.RegisterEventHandler(self.eventHandler)
+            cam.BeginAcquisition()
+            print(f"이미지 취득을 시작합니다.")
 
-    def release(self, subscription):
+    def release(self):
         print("ReactiveX: 구독을 종료합니다.")
         print("STOMP: 메시지 큐를 중지합니다.")
         print("STOMP: 카메라 객체를 반환합니다.")
         try:
             if not self.cameraSetting.setNodeValue('TriggerMode', 'Off'):
-                MQ.pub('/cam-status', {'camNo': '0', 'type': VENDER_TYPE,
+                MQ.pub('/cam-status', {'camNo': '0', 'type': self.VENDER_TYPE,
                                        'status': 'TriggerMode OFF 값 설정에 실패하였습니다. 뷰어를 통해 세팅 값을 초기화하시기 바랍니다.'})
                 print('STOMP: TriggerMode OFF 값 설정에 실패하였습니다. 뷰어를 통해 세팅 값을 초기화하시기 바랍니다.')
             for index, cam in enumerate(self.cam_list):
@@ -512,14 +545,31 @@ class FLIRCameraAction(CameraAction):
             cam = self.cam_list.GetByIndex(index)  # 메모리 자원 해제에 반드시 필요.
             del cam
         self.cam_list.Clear()
-        system.ReleaseInstance()
+        self.system.ReleaseInstance()
         print('STOMP: 메시지 큐 클라이언트를 종료합니다.')
-        if self.subscription is not None:
-            self.subscription.dispose()
+        if self.mq.subscription is not None:
+            self.mq.subscription.dispose()
         MQ.stop()
 
 # 진입점
-FLIRCameraAction()
+flir = FLIRCameraAction()
+
+#daemon2 = threading.Thread(target=fn2, args=())
+#daemon2.setDaemon(True)
+#daemon2.start()
+
+exitFlag = True
+try:
+    while exitFlag:
+        time.sleep(1)
+except KeyboardInterrupt:
+    flir.release()
+
+@atexit.register
+def goodbye():
+    print('You are now leaving the Python sector.')
+
+
 """
 t1 = threading.Thread(target=triggerWatchDog, args=(camIndex,))
 t1.setDaemon(True)
